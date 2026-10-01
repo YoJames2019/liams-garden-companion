@@ -531,7 +531,9 @@ export function initPlantDragMove(): void {
         const tile = pointToFarmTile(clientX, clientY, activePress.target);
         const isValid = tile
             && tile.userSlotIdx === live.ownUserSlotIdx
-            && !tile.object;
+            && tile.localTileIndex !== activePress.source?.localTileIndex
+            && (!tile.object || tile.object.objectType === 'plant');
+            
         marker.visible = Boolean(isValid);
         if (isValid) marker.position.set(tile.x * TILE_SIZE + TILE_SIZE / 2, tile.y * TILE_SIZE + TILE_SIZE / 2);
     }
@@ -569,11 +571,17 @@ export function initPlantDragMove(): void {
         activePress.fadeFrame = 0;
     }
 
-    function hasPlanterPot(amount: number = 1) {
-        return inventoryItems().some(item =>
-            item?.itemType === 'Tool'
-            && item?.toolId === 'PlanterPot'
-            && (item?.quantity ?? 1) >= amount);
+    /** How many Planter Pots are loose in the inventory right now (a stack counts as its quantity). */
+    function planterPotCount() {
+        return inventoryItems().reduce((sum, item) =>
+            item?.itemType === 'Tool' && item?.toolId === 'PlanterPot'
+                ? sum + Math.max(0, item?.quantity ?? 1)
+                : sum, 0);
+    }
+
+    /** Whether the inventory already holds at least `amount` pots - a swap needs two, a move one. */
+    function hasPlanterPot(amount = 1) {
+        return planterPotCount() >= amount;
     }
 
     /**
@@ -582,7 +590,7 @@ export function initPlantDragMove(): void {
      * has to answer now.
      */
     function canGetPlanterPot(amount: number = 1) {
-        return hasPlanterPot(amount) || shackToolCount('PlanterPot') >= amount;
+        return planterPotCount() + shackToolCount('PlanterPot') >= amount;
     }
 
     /**
@@ -671,7 +679,7 @@ export function initPlantDragMove(): void {
         activePress.source = source;
         activePress.phase = 'dragging';
         fadeSourcePlant(activePress);
-        showToast('Drag to a highlighted empty tile and release.', 'success', 0);
+        showToast('Drag to a highlighted tile and release - drop on a plant to swap them.', 'success', 0);
     }
 
     function getValidDestination(activePress) {
@@ -691,86 +699,89 @@ export function initPlantDragMove(): void {
         return destination;
     }
 
+    async function potPlant(tile) {
+        const plantItemId = pageWindow.crypto.randomUUID()
+        showToast(`Picking up ${tile.object.species ?? 'plant'}...`, 'normal', 0);
+        sendPotPlant(tile.localTileIndex, plantItemId);
+
+        const plantItem = await waitFor(() => findPottedPlant(plantItemId), POT_TIMEOUT_MS);
+        if (!plantItem) throw new Error('The server did not return the potted plant');
+        return plantItem
+    }
+
     async function commitHeldMove(activePress) {
         const destination = getValidDestination(activePress);
         activePress.destination = destination;
         activePress.phase = 'potting';
-        const species = activePress.source.object.species;
 
         const swapDestPlant = !!destination.object
 
-        let requiredPlanterPots = swapDestPlant ? 2 : 1
-        let requiredFreeInventorySlots = swapDestPlant ? 2 : 1
+        let requiredPots = swapDestPlant ? 2 : 1
+        let requiredInventorySlots = swapDestPlant ? 2 : 1
 
         // Held for the whole move, not just the fetch: the pot is spent by the PotPlant at the end,
         // and auto-store filing it back in between is what would make a drag fail outright.
         const releasePot = holdTool('PlanterPot');
+
+        let sourcePlant;
+        let destPlant;
+
         try {
-            // Two slots, not one: the pot may still be in the Tool Shack, and potting hands back a
-            // Plant, which stacks onto nothing and always takes a slot of its own.
-            if (!hasPlanterPot(requiredPlanterPots) && !await ensureToolReady('PlanterPot', requiredPlanterPots, 1)) {
-                throw new Error('No Planter Pot could be taken from the Tool Shack. Make room in your inventory.');
+            if (!hasPlanterPot(requiredPots) && !await ensureToolReady('PlanterPot', requiredPots, 1)) {
+                throw new Error(swapDestPlant
+                    ? 'A swap needs two Planter Pots - add another to your inventory or Tool Shack.'
+                    : 'No Planter Pot could be taken from the Tool Shack. Make room in your inventory.');
             }
-            if (freeInventorySlots() < requiredFreeInventorySlots) throw new Error('Your inventory is full, so the plant has nowhere to go');
+            if (freeInventorySlots() < requiredInventorySlots) {
+                throw new Error(swapDestPlant
+                    ? 'A swap needs two free inventory slots for the plants it lifts.'
+                    : 'Your inventory is full, so the plant has nowhere to go');
+            }
 
-            const plantItemId = pageWindow.crypto.randomUUID();
-            showToast(`Picking up ${species ?? 'plant'}...`, 'normal', 0);
-            sendPotPlant(activePress.source.localTileIndex, plantItemId);
-
-            const plantItem = await waitFor(() => findPottedPlant(plantItemId), POT_TIMEOUT_MS);
+            sourcePlant = await potPlant(activePress.source)
             restoreSourcePlant(activePress);
-            if (!plantItem) throw new Error('The server did not return the potted plant');
-
-
+            
             if (swapDestPlant) {
-                const swappedPlantItemId = pageWindow.crypto.randomUUID();
-                showToast(`Picking up ${destination.object.species ?? 'plant'} from destination...`, 'normal', 0);
-                sendPotPlant(destination.localTileIndex, swappedPlantItemId)
-
-                const swappedPlant: any = await waitFor(() => findPottedPlant(swappedPlantItemId), POT_TIMEOUT_MS);
-                if (!swappedPlant) throw new Error('The server did not return the potted plant from the destination tile');
-                
-                await placePlantFromInventory(destination, activePress.source, swappedPlant.id, activePress)
+                destPlant = await potPlant(destination)
             }
             
-            activePress.plantItem = plantItem;
-            activePress.phase = 'ready';
         } finally {
             releasePot();
+            moveBusy = false;
         }
-        await placePlantFromInventory(activePress.source, destination, activePress.plantItem.id, activePress);
+
+        await placePlantFromInventory(activePress.source, destination, sourcePlant.id, activePress);
+
+        if(destPlant) await placePlantFromInventory(destination, activePress.source, destPlant.id, activePress)
     }
 
     async function placePlantFromInventory(source, destination, plantId, activePress) {
         if (activePress.phase === 'placing' || activePress.cancelled) return;
-        try {
-            const currentObject = live.tileSystem?.getTileDataAt({ x: destination.x, y: destination.y });
-            if (currentObject) {
-                activePress.cancelled = true;
-                showToast('Move stopped: the destination became occupied. The plant remains in inventory.', 'error', 5000);
-                return;
-            }
-
-            activePress.phase = 'placing';
-            showToast('Placing plant...', 'normal', 0);
-            sendPlantGardenPlant(destination.localTileIndex, plantId);
-
-            const placed = await waitFor(() => {
-                const object = live.tileSystem?.getTileDataAt({ x: destination.x, y: destination.y });
-                const itemStillHeld = inventoryItems().some(item => item?.id === plantId);
-                return !itemStillHeld && object?.objectType === 'plant'
-                    && isSamePlant(object, source.object);
-            }, PLACE_TIMEOUT_MS, 150);
-
-            if (placed) {
-                showToast('Plant moved.', 'success');
-                log(`Moved ${source.object.species} from slot ${source.localTileIndex} to ${destination.localTileIndex}.`);
-            } else {
-                showToast('Placement was not confirmed. Check your inventory before retrying.', 'error', 5000);
-            }
-        } finally {
-            moveBusy = false;
+        const currentObject = live.tileSystem?.getTileDataAt({ x: destination.x, y: destination.y });
+        if (currentObject) {
+            activePress.cancelled = true;
+            showToast('Move stopped: the destination became occupied. The plant remains in inventory.', 'error', 5000);
+            return;
         }
+
+        activePress.phase = 'placing';
+        showToast('Placing plant...', 'normal', 0);
+        sendPlantGardenPlant(destination.localTileIndex, plantId);
+
+        const placed = await waitFor(() => {
+            const object = live.tileSystem?.getTileDataAt({ x: destination.x, y: destination.y });
+            const itemStillHeld = inventoryItems().some(item => item?.id === plantId);
+            return !itemStillHeld && object?.objectType === 'plant'
+                && isSamePlant(object, source.object);
+        }, PLACE_TIMEOUT_MS, 150);
+
+        if (placed) {
+            showToast('Plant moved.', 'success');
+            log(`Moved ${source.object.species} from slot ${source.localTileIndex} to ${destination.localTileIndex}.`);
+        } else {
+            showToast('Placement was not confirmed. Check your inventory before retrying.', 'error', 5000);
+        }
+        return placed;
     }
 
     function activatePress(activePress) {
