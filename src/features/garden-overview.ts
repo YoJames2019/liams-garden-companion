@@ -9,6 +9,7 @@ import { crystalStrengthBonus, mutationSprite, onSpritesReady, petMetrics, produ
 import { maxSizeMultiplier, slotIsMaxSize, slotScale } from '../crop-size.js';
 import { toast } from '../toast.js';
 import { NAME_OVERRIDES, NUMBER_LOCALE } from '../utils.js';
+import { getPixiGraphicsClass, getPixiTextClass } from '../pixi.js';
 
 interface PlantCatalogEntry {
   crop?: { baseSellPrice?: number; maxScale?: number; maxSizeMultiplier?: number };
@@ -70,6 +71,9 @@ const openFamilies = new Set<string>((() => {
 function saveOpenFamilies(): void {
   try { localStorage.setItem(OPEN_FAMILIES_KEY, JSON.stringify([...openFamilies])); } catch {}
 }
+
+const COUNT_TEXT_STYLE = { fontFamily: 'Arial', fontSize: 200, fontWeight: '700', fill: '#FFFFFF', stroke: { color: '#000000', width: 3 } };
+
 const FOCUS_KEY = 'gardenCompanion.overviewFocus.v1';
 const FOCUS_PRESETS_KEY = 'gardenCompanion.overviewFocusPresets.v1';
 const ALARM_TARGETS_KEY = 'gardenCompanion.overviewAlarmTargets.v1';
@@ -158,25 +162,24 @@ interface FocusConfig {
   mutations: string[];
   mutationRule: 'all' | 'any' | 'none';
   maxSize: boolean;
-  mode: 'highlight' | 'hide';
-  opacity: number;
+  showMatchCount: boolean;
+  nonMatchedOpacity: number;
+  matchedOpacity: number;
 }
 
 function focusDefaults(): FocusConfig {
-  return { enabled: false, scope: 'tracked', mutations: [], mutationRule: 'all', maxSize: false, mode: 'highlight', opacity: .2 };
+  return { enabled: false, scope: 'tracked', mutations: [], mutationRule: 'all', maxSize: false, showMatchCount: false, nonMatchedOpacity: 0.2, matchedOpacity: 1 };
 }
 
 function loadFocus(): FocusConfig {
   try {
     // `invert` was the old name for hide mode; migrate it so existing setups keep behaving the same.
     const stored = JSON.parse(localStorage.getItem(FOCUS_KEY) || '{}');
-    const migrating = stored.mode === undefined && Boolean(stored.invert);
-    const config = { ...focusDefaults(), ...stored, mode: stored.mode ?? (stored.invert ? 'hide' : 'highlight') } as FocusConfig & { invert?: boolean };
+    const config = { ...focusDefaults(), ...stored } as FocusConfig & { invert?: boolean };
     // An inverted setup with nothing selected used to mean "fade the unmutated crops". Under the
     // current matcher no conditions means no filter, so carrying it straight over to hide would dim
     // the entire garden on first load. Only the migration is clamped: choosing Faded out with no
     // conditions afterwards is a deliberate way to dim one species.
-    if (migrating && !config.mutations.length && !config.maxSize) config.mode = 'highlight';
     delete config.invert;
     return config;
   } catch { return focusDefaults(); }
@@ -234,6 +237,59 @@ function installPlantFocus(
   const desiredAlpha = new WeakMap<object, number>();
   const managed = new Set<any>();
   const systemsByViews = new WeakMap<object, any>();
+  const labels = new WeakMap<object, any>();
+  const labelContainers = new Set<any>();
+
+  //TODO - fix: crops on the tile below the current crop can cover the label if they are tall enough
+  function updateCountLabel(container: any, count: number, config: FocusConfig): void {
+    try {
+      if (!config.showMatchCount || !count || !container || container.destroyed) {
+        restoreLabel(container);
+        return;
+      }
+      let entry = labels.get(container);
+      if (!entry) {
+        const PixiText = getPixiTextClass();
+        const PixiGraphics = getPixiGraphicsClass();
+        if (!PixiText || !PixiGraphics) return;
+
+        const text = new PixiText(String(count), COUNT_TEXT_STYLE);
+
+        text.anchor?.set(0.5, 0.5);
+        text.position?.set(0, -8);
+
+        const paddingX = 12;
+        const paddingY = 8;
+        const radius = 20;
+
+        const background = new PixiGraphics();
+
+        background.beginFill(0x000000, 0.5);
+        background.drawRoundedRect(
+          -text.width / 2 - paddingX,
+          -text.height / 2 - paddingY,
+          text.width + paddingX * 2,
+          text.height + paddingY * 2,
+          radius
+        );
+        background.endFill();
+
+        background.position?.set(0, -8);
+
+        container.addChild(background);
+        container.addChild(text);
+
+        entry = { text, background };
+        labels.set(container, entry);
+        labelContainers.add(container);
+      } else if (entry.text.text !== String(count)) {
+        entry.text.text = String(count);
+      }
+    } catch (error) {
+      console.warn('[gardenOverview] updateCountLabel failed, clearing label', error);
+      try { restoreLabel(container); } catch {}
+    }
+  }
 
   function restore(display: any): void {
     if (!display || !originalAlpha.has(display)) return;
@@ -243,8 +299,26 @@ function installPlantFocus(
     managed.delete(display);
   }
 
+  function restoreLabel(container: any): void {
+    if (!container || !labels.has(container)) return;
+
+    const entry = labels.get(container);
+
+    if (entry?.background && !entry.background.destroyed) {
+      entry.background.destroy();
+    }
+
+    if (entry?.text && !entry.text.destroyed) {
+      entry.text.destroy();
+    }
+
+    labels.delete(container);
+    labelContainers.delete(container);
+  }
+
   function restoreAll(): void {
     [...managed].forEach(restore);
+    [...labelContainers].forEach(restoreLabel)
   }
 
   function fade(display: any, opacity: number, seen: Set<any>): void {
@@ -286,7 +360,7 @@ function installPlantFocus(
     };
   }
 
-  function matches(tile: any, slot: PlantSlot, config: FocusConfig): boolean {
+  function matchConditions(tile, slot, config): boolean {
     if (ignorePreserved() && slot.preserved) return false;
     const selected = selectedSpecies();
     // Rare variants live on the slot, so a Purple Daisy inside a Daisy patch is matched by its own
@@ -304,8 +378,13 @@ function installPlantFocus(
       || (config.mutationRule === 'none' ? conditions.every(match => !match)
         : config.mutationRule === 'any' ? conditions.some(Boolean)
           : conditions.every(Boolean));
-    const result = scopeMatches && ruleMatches;
-    return config.mode === 'hide' ? !result : result;
+
+    return scopeMatches && ruleMatches;
+  }
+
+  function matches(tile: any, slot: PlantSlot, config: FocusConfig): boolean {
+    const result = matchConditions(tile, slot, config);
+    return result;
   }
 
   function capture(system: any): void {
@@ -404,18 +483,27 @@ function installPlantFocus(
       const plantVisual = view.childView?.plantVisual;
       const crops = plantVisual?.getCropVisuals?.() || [];
       armView(view);
+
+      const matchCount = slots.reduce((n, slot) => {
+        if (ignorePreserved() && slot.preserved) return n;
+        return n + (matchConditions(tile, slot, config) ? 1 : 0);
+      }, 0);
+
+      updateCountLabel(plantVisual?.container, matchCount, config)
+
       if (Number(tile.maturedAt ?? 0) > now) {
-        fade(plantVisual?.container, config.opacity, seen);
-        crops.forEach((crop: any) => fade(cropContainer(crop), config.opacity, seen));
+        fade(plantVisual?.container, config.nonMatchedOpacity, seen);
+        crops.forEach((crop: any) => fade(cropContainer(crop), config.nonMatchedOpacity, seen));
         return;
       }
+
       const visible = new Map(slots.map(slot => [slot.slotId, matches(tile, slot, config)]));
       if (![...visible.values()].some(Boolean)) {
-        fade(plantVisual?.container, config.opacity, seen);
+        fade(plantVisual?.container, config.nonMatchedOpacity, seen);
         crops.forEach((crop: any) => restore(cropContainer(crop)));
       } else {
         restore(plantVisual?.container);
-        crops.forEach((crop: any) => visible.get(crop?.slotId) === false ? fade(cropContainer(crop), config.opacity, seen) : restore(cropContainer(crop)));
+        crops.forEach((crop: any) => visible.get(crop?.slotId) === false ? fade(cropContainer(crop), config.nonMatchedOpacity, seen) : fade(cropContainer(crop), config.matchedOpacity, seen));
       }
     });
     [...managed].forEach(display => { if (!seen.has(display)) restore(display); });
@@ -1083,10 +1171,8 @@ export function initGardenOverview(): void {
     const rulePhrase = conditionNames.length
       ? ` carrying <b>${focus.mutationRule === 'all' ? 'all' : focus.mutationRule === 'any' ? 'any' : 'none'}</b> of ${escapeHtml(conditionNames.join(', '))}`
       : '';
-    const percent = Math.round(focus.opacity * 100);
-    return focus.mode === 'hide'
-      ? `<b>Faded to <span data-opacity-value>${percent}%</span>:</b> ${escapeHtml(scopeLabel)}${rulePhrase}.`
-      : `<b>Highlighted:</b> ${escapeHtml(scopeLabel)}${rulePhrase}.`;
+    const percent = Math.round(focus.matchedOpacity * 100);
+    return `<b>Opacity <span data-matchedOpacity-value>${percent}%</span>:</b> ${escapeHtml(scopeLabel)}${rulePhrase}.`
   }
 
   function updateCountdowns(panel: HTMLElement, stats: OverviewStats): void {
@@ -1203,7 +1289,8 @@ export function initGardenOverview(): void {
       for (const tile of Object.values(runtime().slot?.data?.garden?.tileObjects ?? {})) for (const slot of tile.slots ?? []) for (const mutation of slot.mutations ?? []) foundMutations.add(mutation);
       for (const mutation of focus.mutations) foundMutations.add(mutation);
       const conditionNames = focusConditionNames();
-      const percent = Math.round(focus.opacity * 100);
+      const nonMatchPercent = Math.round(focus.nonMatchedOpacity * 100);
+      const matchPercent = Math.round(focus.matchedOpacity * 100)
       const pillGroup = (label: string, hint: string, body: string) => `<div class="go-pill-section"><b><span>${escapeHtml(label)}</span>${hint ? `<em>${escapeHtml(hint)}</em>` : ''}</b><div>${body}</div></div>`;
       // The icon carries the name, so the pill only falls back to text when the art has not loaded.
       const mutationPill = (name: string) => {
@@ -1241,8 +1328,9 @@ export function initGardenOverview(): void {
         + settingsHead('Conditions', `${conditionNames.length ? `<button data-focus-clear>Clear</button>` : `<em>none</em>`}`)
         + `${conditionGroups}${otherGroup}${sizeGroup}`
         + settingsHead('What happens to them')
-        + choiceRow('Matches are', 'data-focus-mode', [['highlight', 'Highlighted'], ['hide', 'Faded out']], focus.mode)
-        + `<label class="go-config-row"><span>${focus.mode === 'hide' ? 'Matches sit at' : 'Everything else sits at'} <b data-opacity-value>${percent}%</b></span><input type="range" min="5" max="60" step="5" value="${percent}" data-focus-opacity></label>`
+        + switchRow('data-focus-matchCount', 'disabled', 'Show Match Count', 'Show the number of matched plants on each tile', focus.showMatchCount)
+        + `<label class="go-config-row"><span>Matches sit at <b data-matchedOpacity-value>${matchPercent}%</b></span><input type="range" min="0" max="100" step="5" value="${matchPercent}" data-focus-matchedOpacity></label>`
+        + `<label class="go-config-row"><span>All others sit at <b data-nonMatchedOpacity-value>${nonMatchPercent}%</b></span><input type="range" min="0" max="100" step="5" value="${nonMatchPercent}" data-focus-nonMatchedOpacity></label>`
         // Last in the section so its height changing never shifts the controls above it.
         + `<p class="go-focus-summary"${focus.enabled ? '' : ' data-off'}>${focusSummaryHtml()}</p></section>`;
     }
@@ -1558,12 +1646,18 @@ export function initGardenOverview(): void {
       refreshFocusSummary();
       releaseUnlessTyping(focusEnabled);
     };
-    panel.querySelectorAll<HTMLButtonElement>('[data-focus-mode]').forEach(button => button.onclick = () => { focus.mode = button.dataset.focusMode as FocusConfig['mode']; saveFocusControls(); renderAndRefocus(`[data-focus-mode="${button.dataset.focusMode}"]`); });
     const focusScope = panel.querySelector<HTMLSelectElement>('[data-focus-scope]');
     if (focusScope) {
       focusScope.onchange = () => { focus.scope = focusScope.value; saveFocusControls(); refreshFocusSummary(); releaseUnlessTyping(focusScope); };
       releaseOnCommit(focusScope);
     }
+
+    const focusMatchCount = panel.querySelector<HTMLInputElement>('[data-focus-matchCount]');
+    if (focusMatchCount) focusMatchCount.onchange = () => {
+      focus.showMatchCount = focusMatchCount.checked;
+      saveFocusControls();
+    };
+
     const presetSelect = panel.querySelector<HTMLSelectElement>('[data-focus-preset]');
     if (presetSelect) {
       presetSelect.onchange = () => {
@@ -1628,13 +1722,21 @@ export function initGardenOverview(): void {
     panel.querySelector<HTMLButtonElement>('[data-focus-clear]')?.addEventListener('click', () => { focus.mutations = []; focus.maxSize = false; saveFocusControls(); renderAndRefocus('[data-focus-clear]'); });
     const focusMaxSize = panel.querySelector<HTMLButtonElement>('[data-focus-max-size]');
     if (focusMaxSize) focusMaxSize.onclick = () => { focus.maxSize = !focus.maxSize; saveFocusControls(); renderAndRefocus('[data-focus-max-size]'); };
-    const focusOpacity = panel.querySelector<HTMLInputElement>('[data-focus-opacity]');
+    const focusOpacity = panel.querySelector<HTMLInputElement>('[data-focus-nonMatchedOpacity]');
     if (focusOpacity) {
-      focusOpacity.oninput = () => { focus.opacity = Number(focusOpacity.value) / 100; panel.querySelectorAll<HTMLElement>('[data-opacity-value]').forEach(label => { label.textContent = `${focusOpacity.value}%`; }); saveFocusControls(); };
+      focusOpacity.oninput = () => { focus.nonMatchedOpacity = Number(focusOpacity.value) / 100; panel.querySelectorAll<HTMLElement>('[data-nonMatchedOpacity-value]').forEach(label => { label.textContent = `${focusOpacity.value}%`; }); saveFocusControls(); };
       // Releasing on pointerup rather than change: a drag that lands back on the value it started
       // from fires no change at all, and would otherwise keep hold of the keyboard.
       focusOpacity.onpointerup = () => releaseUnlessTyping(focusOpacity);
       focusOpacity.onchange = () => releaseUnlessTyping(focusOpacity);
+    }
+    const unfocusedOpacity = panel.querySelector<HTMLInputElement>('[data-focus-matchedOpacity]');
+    if (unfocusedOpacity) {
+      unfocusedOpacity.oninput = () => { focus.matchedOpacity = Number(unfocusedOpacity.value) / 100; panel.querySelectorAll<HTMLElement>('[data-matchedOpacity-value]').forEach(label => { label.textContent = `${unfocusedOpacity.value}%`; }); saveFocusControls(); };
+      // Releasing on pointerup rather than change: a drag that lands back on the value it started
+      // from fires no change at all, and would otherwise keep hold of the keyboard.
+      unfocusedOpacity.onpointerup = () => releaseUnlessTyping(unfocusedOpacity);
+      unfocusedOpacity.onchange = () => releaseUnlessTyping(unfocusedOpacity);
     }
     panel.querySelectorAll<HTMLElement>('[data-family]').forEach(row => row.onclick = () => {
       const key = row.dataset.family!;

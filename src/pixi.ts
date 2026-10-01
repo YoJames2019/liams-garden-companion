@@ -10,6 +10,9 @@ export interface PixiSurface {
   toScreenY(value: number): number;
 }
 
+let PixiTextClass: (new (...args: any[]) => any) | null = null;
+let PixiGraphicsClass: (new (...args: any[]) => any) | null = null;
+
 export function installPixiCapture() {
   const store = page.__GARDEN_COMPANION_PIXI__ ||= { app: null, renderer: null };
   for (const name of ['__PIXI_APP_INIT__', '__PIXI_RENDERER_INIT__']) {
@@ -56,6 +59,77 @@ export function findVisiblePixiNodes(surface: PixiSurface, labels: string[]): Ma
     if (Array.isArray(node.children)) stack.push(...node.children);
   }
   return found;
+}
+
+export function findPixiConstructor(root: any, predicate: (node: any) => boolean): (new (...args: any[]) => any) | null {
+  const stack = [root];
+  const seen = new WeakSet<object>();
+
+  while (stack.length) {
+    const node = stack.pop();
+
+    if (!node || typeof node !== 'object' || seen.has(node)) continue;
+    seen.add(node);
+
+    try {
+      if (predicate(node) && node.constructor) {
+        return node.constructor;
+      }
+    } catch {}
+
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) {
+        stack.push(child);
+      }
+    }
+  }
+
+  return null;
+}
+
+export function getPixiTextClass(): (new (...args: any[]) => any) | null {
+  if(PixiTextClass) return PixiTextClass;
+
+  const P = (unsafeWindow as any).PIXI;
+  if (P?.Text) {
+    PixiTextClass = P.Text;
+    return PixiTextClass;
+  }
+
+  const surface = pixiSurface();
+  if (!surface) return null;
+
+  PixiTextClass = findPixiConstructor(
+    surface.stage,
+    node =>
+      (typeof node.text === 'string' || typeof node.text === 'number') &&
+      node.style
+  );
+
+  return PixiTextClass;
+}
+
+export function getPixiGraphicsClass(): (new (...args: any[]) => any) | null {
+  if (PixiGraphicsClass) return PixiGraphicsClass;
+
+  const P = (unsafeWindow as any).PIXI;
+  if (P?.Graphics) {
+    PixiGraphicsClass = P.Graphics;
+    return PixiGraphicsClass;
+  }
+
+  const surface = pixiSurface();
+  if (!surface) return null;
+
+  PixiGraphicsClass = findPixiConstructor(
+    surface.stage,
+    node =>
+      typeof node.beginFill === 'function' &&
+      typeof node.drawRect === 'function' &&
+      typeof node.endFill === 'function'
+  );
+
+  return PixiGraphicsClass;
 }
 
 export function findPixiCard() {
