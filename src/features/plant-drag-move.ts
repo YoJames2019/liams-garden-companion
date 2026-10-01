@@ -545,6 +545,7 @@ export function initPlantDragMove(): void {
             && tile.userSlotIdx === live.ownUserSlotIdx
             && tile.localTileIndex !== activePress.source?.localTileIndex
             && (!tile.object || tile.object.objectType === 'plant');
+            
         marker.visible = Boolean(isValid);
         if (isValid) marker.position.set(tile.x * TILE_SIZE + TILE_SIZE / 2, tile.y * TILE_SIZE + TILE_SIZE / 2);
     }
@@ -600,7 +601,7 @@ export function initPlantDragMove(): void {
      * checks that a move is possible - the fetching itself waits for the hold to finish, since it
      * needs to wait on the server and a press has to answer now.
      */
-    function canGetPlanterPot(amount = 1) {
+    function canGetPlanterPot(amount: number = 1) {
         return planterPotCount() + shackToolCount('PlanterPot') >= amount;
     }
 
@@ -703,28 +704,21 @@ export function initPlantDragMove(): void {
         if (destination.userSlotIdx !== live.ownUserSlotIdx) {
             throw new Error('That tile is not in your garden');
         }
-        if (destination.localTileIndex === activePress.source.localTileIndex) {
-            throw new Error('That is where the plant already is');
-        }
-        // A plant on the tile is a swap, not a blocker. Anything else - decor, an egg - has no swap
-        // to offer and still blocks the drop.
-        if (destination.object && destination.object.objectType !== 'plant') {
-            throw new Error('The destination tile holds something that is not a plant, so there is nothing to swap');
-        }
+        
+        if (activePress.source.localTileIndex === destination.localTileIndex) throw new Error('The destination is the same as the source tile');
+
+        if (destination.object && destination.object?.objectType !== 'plant') throw new Error('The destination tile is occupied by a non-plant');
         return destination;
     }
 
-    /**
-     * Pot the plant off one tile and hand back the inventory item it becomes, named by us so it can
-     * be found again (see sendPotPlant). Throws if the server never returns it.
-     */
     async function potPlant(tile) {
-        const plantItemId = pageWindow.crypto.randomUUID();
-        showToast(`Picking up ${tile.object?.species ?? 'plant'}...`, 'normal', 0);
+        const plantItemId = pageWindow.crypto.randomUUID()
+        showToast(`Picking up ${tile.object.species ?? 'plant'}...`, 'normal', 0);
         sendPotPlant(tile.localTileIndex, plantItemId);
+
         const plantItem = await waitFor(() => findPottedPlant(plantItemId), POT_TIMEOUT_MS);
         if (!plantItem) throw new Error('The server did not return the potted plant');
-        return plantItem;
+        return plantItem
     }
 
     async function commitHeldMove(activePress) {
@@ -733,48 +727,75 @@ export function initPlantDragMove(): void {
         // A plant already on the destination is swapped with the one being moved, not treated as a block.
         const swap = Boolean(destination.object);
         activePress.phase = 'potting';
-        // A swap lifts two plants at once, so it wants two pots and two free slots; a plain move one
-        // of each. Pots stack into a single slot, so only the plants handed back claim inventory room.
-        const potsNeeded = swap ? 2 : 1;
-        const slotsNeeded = swap ? 2 : 1;
-        // Held for the whole move, not just the fetch: a pot is spent by each PotPlant, and auto-store
-        // filing one back in between is what would make a drag fail outright.
+
+        const swapDestPlant = !!destination.object
+
+        let requiredPots = swapDestPlant ? 2 : 1
+        let requiredInventorySlots = swapDestPlant ? 2 : 1
+
+        // Held for the whole move, not just the fetch: the pot is spent by the PotPlant at the end,
+        // and auto-store filing it back in between is what would make a drag fail outright.
         const releasePot = holdTool('PlanterPot');
+
         let sourcePlant;
-        let destPlant = null;
+        let destPlant;
+
         try {
-            try {
-                if (!hasPlanterPot(potsNeeded) && !await ensureToolReady('PlanterPot', potsNeeded, 1)) {
-                    throw new Error(swap
-                        ? 'A swap needs two Planter Pots - add another to your inventory or Tool Shack.'
-                        : 'No Planter Pot could be taken from the Tool Shack. Make room in your inventory.');
-                }
-                if (freeInventorySlots() < slotsNeeded) {
-                    throw new Error(swap
-                        ? 'A swap needs two free inventory slots for the plants it lifts.'
-                        : 'Your inventory is full, so the plant has nowhere to go');
-                }
-
-                // Lift both plants into the inventory before planting either. Should a later placement
-                // fail, both are recoverable from the inventory rather than one stranded on a tile.
-                sourcePlant = await potPlant(activePress.source);
-                restoreSourcePlant(activePress);
-                if (swap) destPlant = await potPlant(destination);
-                activePress.plantItem = sourcePlant;
-                activePress.phase = 'ready';
-            } finally {
-                releasePot();
+            if (!hasPlanterPot(requiredPots) && !await ensureToolReady('PlanterPot', requiredPots, 1)) {
+                throw new Error(swapDestPlant
+                    ? 'A swap needs two Planter Pots - add another to your inventory or Tool Shack.'
+                    : 'No Planter Pot could be taken from the Tool Shack. Make room in your inventory.');
+            }
+            if (freeInventorySlots() < requiredInventorySlots) {
+                throw new Error(swapDestPlant
+                    ? 'A swap needs two free inventory slots for the plants it lifts.'
+                    : 'Your inventory is full, so the plant has nowhere to go');
             }
 
-            // The moved plant takes the destination; on a swap the destination's plant takes the
-            // now-empty source tile. Both tiles are empty by now, so neither placement blocks the other.
-            await placePlant(activePress.source.object, destination, sourcePlant.id, activePress);
-            if (swap && destPlant) {
-                await placePlant(destination.object, activePress.source, destPlant.id, activePress);
+            sourcePlant = await potPlant(activePress.source)
+            restoreSourcePlant(activePress);
+            
+            if (swapDestPlant) {
+                destPlant = await potPlant(destination)
             }
+            
         } finally {
+            releasePot();
             moveBusy = false;
         }
+
+        await placePlantFromInventory(activePress.source, destination, sourcePlant.id, activePress);
+
+        if(destPlant) await placePlantFromInventory(destination, activePress.source, destPlant.id, activePress)
+    }
+
+    async function placePlantFromInventory(source, destination, plantId, activePress) {
+        if (activePress.phase === 'placing' || activePress.cancelled) return;
+        const currentObject = live.tileSystem?.getTileDataAt({ x: destination.x, y: destination.y });
+        if (currentObject) {
+            activePress.cancelled = true;
+            showToast('Move stopped: the destination became occupied. The plant remains in inventory.', 'error', 5000);
+            return;
+        }
+
+        activePress.phase = 'placing';
+        showToast('Placing plant...', 'normal', 0);
+        sendPlantGardenPlant(destination.localTileIndex, plantId);
+
+        const placed = await waitFor(() => {
+            const object = live.tileSystem?.getTileDataAt({ x: destination.x, y: destination.y });
+            const itemStillHeld = inventoryItems().some(item => item?.id === plantId);
+            return !itemStillHeld && object?.objectType === 'plant'
+                && isSamePlant(object, source.object);
+        }, PLACE_TIMEOUT_MS, 150);
+
+        if (placed) {
+            showToast('Plant moved.', 'success');
+            log(`Moved ${source.object.species} from slot ${source.localTileIndex} to ${destination.localTileIndex}.`);
+        } else {
+            showToast('Placement was not confirmed. Check your inventory before retrying.', 'error', 5000);
+        }
+        return placed;
     }
 
     /**
