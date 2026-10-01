@@ -723,9 +723,7 @@ export function initPlantDragMove(): void {
 
     async function commitHeldMove(activePress) {
         const destination = getValidDestination(activePress);
-        activePress.destination = destination;
         // A plant already on the destination is swapped with the one being moved, not treated as a block.
-        const swap = Boolean(destination.object);
         activePress.phase = 'potting';
 
         const swapDestPlant = !!destination.object
@@ -769,8 +767,12 @@ export function initPlantDragMove(): void {
         if(destPlant) await placePlantFromInventory(destination, activePress.source, destPlant.id, activePress)
     }
 
+    /**
+     * Plant an inventory item onto a tile and confirm the server placed it. `plantObject` is the tile
+     * data the plant was lifted from, used only to recognise it once it lands. Returns whether it settled.
+     */
     async function placePlantFromInventory(source, destination, plantId, activePress) {
-        if (activePress.phase === 'placing' || activePress.cancelled) return;
+        if (activePress.cancelled) return;
         const currentObject = live.tileSystem?.getTileDataAt({ x: destination.x, y: destination.y });
         if (currentObject) {
             activePress.cancelled = true;
@@ -792,39 +794,6 @@ export function initPlantDragMove(): void {
         if (placed) {
             showToast('Plant moved.', 'success');
             log(`Moved ${source.object.species} from slot ${source.localTileIndex} to ${destination.localTileIndex}.`);
-        } else {
-            showToast('Placement was not confirmed. Check your inventory before retrying.', 'error', 5000);
-        }
-        return placed;
-    }
-
-    /**
-     * Plant an inventory item onto a tile and confirm the server placed it. `plantObject` is the tile
-     * data the plant was lifted from, used only to recognise it once it lands. Returns whether it settled.
-     */
-    async function placePlant(plantObject, destination, plantId, activePress) {
-        if (activePress.cancelled) return false;
-        const currentObject = live.tileSystem?.getTileDataAt({ x: destination.x, y: destination.y });
-        if (currentObject) {
-            activePress.cancelled = true;
-            showToast('Move stopped: a tile became occupied. Your plants are safe in your inventory.', 'error', 5000);
-            return false;
-        }
-
-        activePress.phase = 'placing';
-        showToast('Placing plant...', 'normal', 0);
-        sendPlantGardenPlant(destination.localTileIndex, plantId);
-
-        const placed = await waitFor(() => {
-            const object = live.tileSystem?.getTileDataAt({ x: destination.x, y: destination.y });
-            const itemStillHeld = inventoryItems().some(item => item?.id === plantId);
-            return !itemStillHeld && object?.objectType === 'plant'
-                && isSamePlant(object, plantObject);
-        }, PLACE_TIMEOUT_MS, 150);
-
-        if (placed) {
-            showToast('Plant moved.', 'success');
-            log(`Placed ${plantObject?.species ?? 'plant'} on slot ${destination.localTileIndex}.`);
         } else {
             showToast('Placement was not confirmed. Check your inventory before retrying.', 'error', 5000);
         }
